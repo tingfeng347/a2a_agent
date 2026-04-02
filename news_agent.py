@@ -1,3 +1,4 @@
+import os
 import re
 import xml.etree.ElementTree as ET
 from typing import override
@@ -19,12 +20,56 @@ from a2a.types import (
     TaskStatusUpdateEvent,
 )
 from a2a.utils import new_text_artifact
+from openai import OpenAI
+import dotenv
+
+dotenv.load_dotenv()
+
+SUBAGENT_MODEL = os.getenv("SUBAGENT_MODEL")
+SUBAGENT_BASE_URL = os.getenv("SUBAGENT_BASE_URL")
+SUBAGENT_API_KEY = os.getenv("SUBAGENT_API_KEY")
+
+llm_client = OpenAI(base_url=SUBAGENT_BASE_URL, api_key=SUBAGENT_API_KEY)
 
 
 def extract_topic(query: str) -> str:
     cleaned = re.sub(r"(帮我|请|一下|看看|查询|搜索|最近|最新|新闻|资讯|热点|消息|查|查下|查一下)", " ", query)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned or "今日热点"
+
+
+def polish_news_result_with_llm(topic: str, raw_result: str) -> str:
+    try:
+        response = llm_client.chat.completions.create(
+            model=SUBAGENT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是新闻摘要助手。"
+                        "根据原始新闻列表，输出更易读的中文摘要。"
+                        "输出要求："
+                        "1. 只输出中文纯文本；"
+                        "2. 先给一段2-3句的整体趋势总结；"
+                        "3. 再列出最多5条新闻，每条包含标题和一句亮点；"
+                        "4. 不要捏造原始列表中没有的信息；"
+                        "5. 不要使用 markdown。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"主题：{topic}\n原始新闻：\n{raw_result}",
+                },
+            ],
+            extra_body={"enable_thinking": False},
+        )
+        content = response.choices[0].message.content
+        if content:
+            return f"新闻子Agent结果：{content.strip()}"
+    except Exception:
+        pass
+
+    return raw_result
 
 
 async def query_news(topic: str) -> str:
@@ -42,14 +87,15 @@ async def query_news(topic: str) -> str:
     if not items:
         return f"新闻子Agent没有找到与“{topic}”相关的新闻。"
 
-    lines = [f"新闻子Agent结果：与“{topic}”相关的新闻如下："]
+    lines = [f"新闻Agent结果：与“{topic}”相关的新闻如下："]
     for index, item in enumerate(items[:5], start=1):
         title = (item.findtext("title") or "").strip()
         link = (item.findtext("link") or "").strip()
         pub_date = (item.findtext("pubDate") or "").strip()
         lines.append(f"{index}. {title} | {pub_date} | {link}")
 
-    return "\n".join(lines)
+    raw_result = "\n".join(lines)
+    return polish_news_result_with_llm(topic, raw_result)
 
 
 class NewsAgentExecutor(AgentExecutor):

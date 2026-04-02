@@ -1,3 +1,4 @@
+import os
 import re
 from typing import override
 
@@ -17,6 +18,16 @@ from a2a.types import (
     TaskStatusUpdateEvent,
 )
 from a2a.utils import new_text_artifact
+from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()   
+
+SUBAGENT_MODEL = os.getenv("SUBAGENT_MODEL")
+SUBAGENT_BASE_URL = os.getenv("SUBAGENT_BASE_URL")
+SUBAGENT_API_KEY = os.getenv("SUBAGENT_API_KEY")
+
+llm_client = OpenAI(base_url=SUBAGENT_BASE_URL, api_key=SUBAGENT_API_KEY)
 
 
 def extract_location(query: str) -> str:
@@ -69,6 +80,37 @@ def weather_code_to_text(code: int) -> str:
     return WEATHER_CODE_MAP.get(code, f"天气代码{code}")
 
 
+def polish_weather_result_with_llm(raw_result: str) -> str:
+    try:
+        response = llm_client.chat.completions.create(
+            model=SUBAGENT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是天气分析助手。"
+                        "根据原始天气数据，生成更自然、可执行的中文天气结论。"
+                        "输出要求："
+                        "1. 只输出中文纯文本；"
+                        "2. 第一段给天气结论；"
+                        "3. 第二段给穿衣和出行建议；"
+                        "4. 不要编造原始数据中没有的事实；"
+                        "5. 不要使用 markdown。"
+                    ),
+                },
+                {"role": "user", "content": raw_result},
+            ],
+            extra_body={"enable_thinking": False},
+        )
+        content = response.choices[0].message.content
+        if content:
+            return f"天气子Agent结果：{content.strip()}"
+    except Exception:
+        pass
+
+    return raw_result
+
+
 async def query_weather(location: str) -> str:
     if not location:
         return "天气子Agent没有识别到城市，请在问题里明确城市名称。"
@@ -109,11 +151,13 @@ async def query_weather(location: str) -> str:
     wind = current["wind_speed_10m"]
     resolved_name = place["name"]
 
-    return (
-        f"天气子Agent结果：{resolved_name}当前{desc}，实时温度{current['temperature_2m']}摄氏度，"
+    raw_result = (
+        f"天气Agent结果：{resolved_name}当前{desc}，实时温度{current['temperature_2m']}摄氏度，"
         f"体感{feels_like}摄氏度，今天最高{max_temp}摄氏度，最低{min_temp}摄氏度，"
         f"湿度{humidity}%，风速{wind}公里每小时。"
     )
+
+    return polish_weather_result_with_llm(raw_result)
 
 
 class WeatherAgentExecutor(AgentExecutor):
