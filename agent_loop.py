@@ -144,11 +144,11 @@ async def call_a2a_agent(base_url: str, query: str) -> str:
         return last_text or "子Agent没有返回内容。"
 
 
-async def ask_weather_agent(query: str) -> str:
+async def weather_agent(query: str) -> str:
     return await call_a2a_agent(WEATHER_AGENT_BASE_URL, query)
 
 
-async def ask_news_agent(query: str) -> str:
+async def news_agent(query: str) -> str:
     return await call_a2a_agent(NEWS_AGENT_BASE_URL, query)
 
 
@@ -157,17 +157,17 @@ async def handle_bash(arguments: dict[str, Any]) -> str:
 
 
 async def handle_weather(arguments: dict[str, Any]) -> str:
-    return await ask_weather_agent(arguments.get("query", ""))
+    return await weather_agent(arguments.get("query", ""))
 
 
 async def handle_news(arguments: dict[str, Any]) -> str:
-    return await ask_news_agent(arguments.get("query", ""))
+    return await news_agent(arguments.get("query", ""))
 
 
 TOOL_HANDLERS = {
     "bash": handle_bash,
-    "ask_weather_agent": handle_weather,
-    "ask_news_agent": handle_news,
+    "weather_agent": handle_weather,
+    "news_agent": handle_news,
 }
 
 
