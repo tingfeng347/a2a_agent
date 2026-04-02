@@ -24,8 +24,8 @@ WEATHER_AGENT_BASE_URL = "http://localhost:10002"
 NEWS_AGENT_BASE_URL = "http://localhost:10003"
 
 client = OpenAI(
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-    api_key="sk-c0984e52de364cd7aea86f5c7172f3b6",
+    base_url=os.getenv("OPENAI_BASE_URL"),
+    api_key=os.getenv("OPENAI_API_KEY"),
 )
 
 SYSTEM_PROMPT = """你是 MagicCode，一名能够自主编排子Agent的终端 AI 助手，回复尽量简洁有说服力。
