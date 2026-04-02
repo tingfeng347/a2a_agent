@@ -3,6 +3,7 @@ import json
 import locale
 import platform
 import subprocess
+from typing import Any
 
 import dotenv
 import httpx
@@ -15,10 +16,10 @@ from a2a.client import (
 from a2a.types import TransportProtocol
 from a2a.utils.message import get_message_text
 from openai import OpenAI
-
 dotenv.load_dotenv()
+import os
 
-MODEL = "qwen3.5-27b"
+
 WEATHER_AGENT_BASE_URL = "http://localhost:10002"
 NEWS_AGENT_BASE_URL = "http://localhost:10003"
 
@@ -37,7 +38,7 @@ SYSTEM_PROMPT = """你是 MagicCode，一名能够自主编排子Agent的终端 
 ## 调用规则
 1. 用户的问题涉及天气、气温、降雨、穿衣建议、出行天气时，优先调用 ask_weather_agent。
 2. 用户的问题涉及新闻、热点、最近发生了什么、某个主题的资讯时，优先调用 ask_news_agent。
-3. 同一个问题如果同时涉及天气和新闻，可以连续调用多个子Agent，再整合结果回复。
+3. 同一个问题如果同时涉及天气和新闻，可以在同一轮并行调用多个子Agent，再整合结果回复。
 4. 不要为了查询天气或新闻去调用 bash，优先使用对应子Agent。
 
 ## 严格遵守
@@ -64,7 +65,7 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "ask_weather_agent",
+            "name": "weather_agent",
             "description": "通过 A2A 协议调用天气子Agent，查询天气、温度、降雨和出行建议。",
             "parameters": {
                 "type": "object",
@@ -76,7 +77,7 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "ask_news_agent",
+            "name": "news_agent",
             "description": "通过 A2A 协议调用新闻子Agent，查询实时新闻、热点和某个主题的资讯。",
             "parameters": {
                 "type": "object",
@@ -143,18 +144,30 @@ async def call_a2a_agent(base_url: str, query: str) -> str:
         return last_text or "子Agent没有返回内容。"
 
 
-def ask_weather_agent(query: str) -> str:
-    return asyncio.run(call_a2a_agent(WEATHER_AGENT_BASE_URL, query))
+async def ask_weather_agent(query: str) -> str:
+    return await call_a2a_agent(WEATHER_AGENT_BASE_URL, query)
 
 
-def ask_news_agent(query: str) -> str:
-    return asyncio.run(call_a2a_agent(NEWS_AGENT_BASE_URL, query))
+async def ask_news_agent(query: str) -> str:
+    return await call_a2a_agent(NEWS_AGENT_BASE_URL, query)
+
+
+async def handle_bash(arguments: dict[str, Any]) -> str:
+    return await asyncio.to_thread(run_bash, arguments.get("command", ""))
+
+
+async def handle_weather(arguments: dict[str, Any]) -> str:
+    return await ask_weather_agent(arguments.get("query", ""))
+
+
+async def handle_news(arguments: dict[str, Any]) -> str:
+    return await ask_news_agent(arguments.get("query", ""))
 
 
 TOOL_HANDLERS = {
-    "bash": lambda arguments: run_bash(arguments.get("command", "")),
-    "ask_weather_agent": lambda arguments: ask_weather_agent(arguments.get("query", "")),
-    "ask_news_agent": lambda arguments: ask_news_agent(arguments.get("query", "")),
+    "bash": handle_bash,
+    "ask_weather_agent": handle_weather,
+    "ask_news_agent": handle_news,
 }
 
 
@@ -173,11 +186,11 @@ class MagicCode:
             {
                 "role": "system",
                 "content": (
-                    "模拟人类的思考过程，规划下一步要做什么。"
+                    "模拟人类的思考过程，简短有力，最多25字，规划下一步要做什么。"
                     "要求："
                     "1. 输出内容必须是中文，且只包含对当前用户输入的理解与下一步意图；"
                     "2. 必须明确写出“无需调用工具”或“需要调用什么工具”；"
-                    "3. 如果是天气问题要写 ask_weather_agent，如果是新闻问题要写 ask_news_agent；"
+                    "3. 如果是天气问题要调用weather_agent，如果是新闻问题要调用news_agent；"
                     "4. 不要分点，不要编号，不要 markdown；"
                     "5. 不要直接给最终回答内容；"
                     "6. 不要输出多余解释。"
@@ -186,7 +199,7 @@ class MagicCode:
         ]
 
         response = client.chat.completions.create(
-            model=MODEL,
+            model=os.getenv("OPENAI_MODEL"),
             messages=think_messages,
             extra_body={"enable_thinking": False},
         )
@@ -195,7 +208,33 @@ class MagicCode:
             return "用户意图不明确，无法判断是否需要调用工具。"
         return sanitize_text(msg.content.strip())
 
-    def chat(self, user_input: str):
+    async def _run_single_tool_call(self, tc, tool_count: int) -> dict[str, str | int]:
+        name = tc.function.name
+        try:
+            args = json.loads(tc.function.arguments or "{}")
+        except json.JSONDecodeError:
+            args = {}
+
+        info = json.dumps(args, ensure_ascii=False)
+        if len(info) > 160:
+            info = info[:160] + "..."
+
+        print(f"[{tool_count}] Act: 调用工具 {name} {info}")
+
+        handler = TOOL_HANDLERS.get(name)
+        if not handler:
+            result = f"Unknown tool: {name}"
+        else:
+            result = await handler(args)
+        result = sanitize_text(result)
+
+        return {
+            "tool_call_id": tc.id,
+            "result": result,
+            "tool_count": tool_count,
+        }
+
+    async def chat(self, user_input: str):
         tool_count = 0
         safe_input = sanitize_text(user_input)
 
@@ -207,9 +246,10 @@ class MagicCode:
 
         while True:
             response = client.chat.completions.create(
-                model=MODEL,
+                model=os.getenv("OPENAI_MODEL"),
                 messages=self.history,
                 tools=TOOLS,
+                parallel_tool_calls=True,
                 extra_body={"enable_thinking": False},
             )
 
@@ -222,30 +262,22 @@ class MagicCode:
             if not message.tool_calls:
                 break
 
+            tasks = []
             for tc in message.tool_calls:
                 tool_count += 1
-                name = tc.function.name
-                try:
-                    args = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    args = {}
+                tasks.append(self._run_single_tool_call(tc, tool_count))
 
-                info = json.dumps(args, ensure_ascii=False)
-                if len(info) > 160:
-                    info = info[:160] + "..."
+            tool_results = await asyncio.gather(*tasks)
 
-                print(f"[{tool_count}] Act: 调用工具 {name} {info}")
-
-                handler = TOOL_HANDLERS.get(name)
-                result = handler(args) if handler else f"Unknown tool: {name}"
-                result = sanitize_text(result)
-
-                print(f"[{tool_count}] Obs: {result.strip() or '(无输出)'}")
+            for item in tool_results:
+                n = item["tool_count"]
+                result = item["result"]
+                print(f"[{n}] Obs: {result.strip() or '(无输出)'}")
 
                 self.history.append(
                     {
                         "role": "tool",
-                        "tool_call_id": tc.id,
+                        "tool_call_id": item["tool_call_id"],
                         "content": result,
                     }
                 )
@@ -269,7 +301,7 @@ class MagicCode:
                     print("历史已清空")
                     continue
 
-                self.chat(user_input)
+                asyncio.run(self.chat(user_input))
                 print()
 
             except KeyboardInterrupt:
