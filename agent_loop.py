@@ -4,6 +4,7 @@ import locale
 import platform
 import subprocess
 
+import dotenv
 import httpx
 from a2a.client import (
     A2ACardResolver,
@@ -14,7 +15,7 @@ from a2a.client import (
 from a2a.types import TransportProtocol
 from a2a.utils.message import get_message_text
 from openai import OpenAI
-import dotenv
+
 dotenv.load_dotenv()
 
 MODEL = "qwen3.5-27b"
@@ -248,20 +249,6 @@ class MagicCode:
                         "content": result,
                     }
                 )
-
-            subagent_tools = {"ask_weather_agent", "ask_news_agent"}
-            if message.tool_calls and all(tc.function.name in subagent_tools for tc in message.tool_calls):
-                direct_results = []
-                for item in reversed(self.history):
-                    if item.get("role") != "tool":
-                        break
-                    direct_results.append(item.get("content", ""))
-
-                direct_results.reverse()
-                merged = "\n\n".join([r.strip() for r in direct_results if r and r.strip()])
-                if merged:
-                    print(f"Result: {merged}")
-                break
 
             if tool_count > 20:
                 print("Tool call limit reached (20)")
