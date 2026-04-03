@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import json
 import locale
@@ -20,6 +21,7 @@ from a2a.types import AgentCard
 from a2a.types import TransportProtocol
 from a2a.utils.message import get_message_text
 from openai import OpenAI
+
 dotenv.load_dotenv()
 import os
 
@@ -28,6 +30,7 @@ client = OpenAI(
     base_url=os.getenv("OPENAI_BASE_URL"),
     api_key=os.getenv("OPENAI_API_KEY"),
 )
+
 
 @dataclass
 class DiscoveredAgent:
@@ -42,7 +45,7 @@ def parse_subagent_index() -> list[str]:
     # 支持通过环境变量覆盖默认索引，便于后续扩展更多子 agent。
     raw = os.getenv("A2A_AGENT_URLS", "")
     urls = [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
-    return urls 
+    return urls
 
 
 def slugify_tool_name(value: str) -> str:
@@ -112,7 +115,9 @@ def build_system_prompt(agents: dict[str, DiscoveredAgent]) -> str:
     agent_lines = []
     for item in agents.values():
         skill_names = ", ".join(
-            skill.name or skill.id for skill in (item.card.skills or []) if (skill.name or skill.id)
+            skill.name or skill.id
+            for skill in (item.card.skills or [])
+            if (skill.name or skill.id)
         )
         suffix = f" 技能：{skill_names}。" if skill_names else ""
         agent_lines.append(f"- {item.tool_name}：{item.description}{suffix}")
@@ -174,8 +179,10 @@ def build_tools(agents: dict[str, DiscoveredAgent]) -> list[dict[str, Any]]:
     return tools
 
 
-def run_bash(command: str, timeout: int = 10) -> str:
-    # 提供一个兜底 shell 工具，处理本地搜索、环境检查等任务。
+def run_bash(command: str, timeout: int = 10, debug: bool = False) -> str:
+    if debug:
+        print(f"[DEBUG] 执行bash命令: {command}")
+    
     try:
         if platform.system().lower().startswith("win"):
             proc = subprocess.run(
@@ -198,13 +205,21 @@ def run_bash(command: str, timeout: int = 10) -> str:
                 encoding=locale.getpreferredencoding(False),
                 errors="replace",
             )
-        return proc.stdout or ""
+        result = proc.stdout or ""
+        
+        if debug:
+            print(f"[DEBUG] Bash命令执行完成，返回长度: {len(result)} 字符")
+        
+        return result
     except Exception as e:
         return f"Error running command: {e}"
 
 
-async def call_a2a_agent(base_url: str, query: str) -> str:
-    # 通过 A2A 协议向子 agent 发送请求，并提取最终文本结果。
+async def call_a2a_agent(base_url: str, query: str, debug: bool = False) -> str:
+    if debug:
+        print(f"[DEBUG] 调用子Agent: {base_url}")
+        print(f"[DEBUG] 发送查询: {query}")
+
     async with httpx.AsyncClient(timeout=30.0) as httpx_client:
         resolver = A2ACardResolver(httpx_client=httpx_client, base_url=base_url)
         card = await resolver.get_agent_card()
@@ -228,12 +243,17 @@ async def call_a2a_agent(base_url: str, query: str) -> str:
             if text:
                 last_text = text
 
-        return last_text or "子Agent没有返回内容。"
+        result = last_text or "子Agent没有返回内容。"
+
+        if debug:
+            print(f"[DEBUG] 子Agent {base_url} 返回结果:")
+            print(f"[DEBUG] {result}")
+
+        return result
 
 
-async def handle_bash(arguments: dict[str, Any]) -> str:
-    # 将阻塞式 shell 调用放到线程池执行，避免卡住事件循环。
-    return await asyncio.to_thread(run_bash, arguments.get("command", ""))
+async def handle_bash(arguments: dict[str, Any], debug: bool = False) -> str:
+    return await asyncio.to_thread(run_bash, arguments.get("command", ""), 10, debug)
 
 
 def sanitize_text(text: str) -> str:
@@ -255,8 +275,8 @@ def print_discovered_agents(agents: dict[str, DiscoveredAgent], title: str) -> N
 
 
 class MagicCode:
-    def __init__(self):
-        # 初始化时先扫描子 agent，再据此生成 prompt、tools 和会话历史。
+    def __init__(self, debug: bool = False):
+        self.debug = debug
         self.discovered_agents = asyncio.run(discover_subagents())
         self.system_prompt = build_system_prompt(self.discovered_agents)
         self.tools = build_tools(self.discovered_agents)
@@ -275,16 +295,31 @@ class MagicCode:
         print_discovered_agents(self.discovered_agents, "[discover] 刷新扫描结果")
 
     async def handle_subagent(self, tool_name: str, arguments: dict[str, Any]) -> str:
-        # 将模型选中的工具名映射回子 agent 地址，再转发 query。
         agent = self.discovered_agents.get(tool_name)
         if not agent:
             return f"未找到名为 {tool_name} 的子Agent。"
-        return await call_a2a_agent(agent.base_url, arguments.get("query", ""))
+
+        if self.debug:
+            print(f"[DEBUG] 准备调用子Agent: {tool_name}")
+            print(f"[DEBUG] Agent URL: {agent.base_url}")
+            print(f"[DEBUG] 参数: {json.dumps(arguments, ensure_ascii=False)}")
+
+        result = await call_a2a_agent(
+            agent.base_url, arguments.get("query", ""), self.debug
+        )
+
+        if self.debug:
+            print(f"[DEBUG] 子Agent {tool_name} 执行完成")
+
+        return result
 
     def think_first(self, user_input: str) -> str:
-        # 先做一轮轻量意图规划，便于在终端里看到主 agent 的下一步动作。
         safe_input = sanitize_text(user_input)
         tool_names = ", ".join(self.discovered_agents.keys()) or "无可用子Agent"
+        
+        if self.debug:
+            print(f"[DEBUG] 开始思考用户输入...")
+        
         think_messages = self.history + [
             {"role": "user", "content": safe_input},
             {
@@ -293,7 +328,7 @@ class MagicCode:
                     "模拟人类的思考过程，简短有力，最多25字，规划下一步要做什么。"
                     "要求："
                     "1. 输出内容必须是中文，且只包含对当前用户输入的理解与下一步意图；"
-                    "2. 必须明确写出“无需调用工具”或“需要调用什么工具”；"
+                    "2. 必须明确写出无需调用工具或需要调用什么工具；"
                     f"3. 如需调用子Agent，只能从这些工具里选择：{tool_names}；"
                     "4. 不要分点，不要编号，不要 markdown；"
                     "5. 不要直接给最终回答内容；"
@@ -310,10 +345,15 @@ class MagicCode:
         msg = response.choices[0].message
         if not msg.content:
             return "用户意图不明确，无法判断是否需要调用工具。"
-        return sanitize_text(msg.content.strip())
+        
+        result = sanitize_text(msg.content.strip())
+        
+        if self.debug:
+            print(f"[DEBUG] 思考结果: {result}")
+        
+        return result
 
     async def _run_single_tool_call(self, tc, tool_count: int) -> dict[str, str | int]:
-        # 封装单次工具调用，便于后续并行执行多个 tool call。
         name = tc.function.name
         try:
             args = json.loads(tc.function.arguments or "{}")
@@ -326,11 +366,18 @@ class MagicCode:
 
         print(f"[{tool_count}] Act: 调用工具 {name} {info}")
 
+        if self.debug:
+            print(f"[DEBUG] 工具调用详情: {name}")
+            print(f"[DEBUG] 完整参数: {json.dumps(args, ensure_ascii=False, indent=2)}")
+
         if name == "bash":
-            result = await handle_bash(args)
+            result = await handle_bash(args, self.debug)
         else:
             result = await self.handle_subagent(name, args)
         result = sanitize_text(result)
+
+        if self.debug:
+            print(f"[DEBUG] 工具 {name} 返回结果长度: {len(result)} 字符")
 
         return {
             "tool_call_id": tc.id,
@@ -339,9 +386,12 @@ class MagicCode:
         }
 
     async def chat(self, user_input: str):
-        # 单轮对话可能包含多次工具调用，直到模型给出最终回复为止。
         tool_count = 0
         safe_input = sanitize_text(user_input)
+
+        if self.debug:
+            print(f"[DEBUG] ========== 开始处理用户输入 ==========")
+            print(f"[DEBUG] 用户输入: {safe_input}")
 
         think_text = self.think_first(safe_input)
         print(f"Think: {think_text}")
@@ -350,6 +400,9 @@ class MagicCode:
         self.history.append({"role": "assistant", "content": f"{think_text}"})
 
         while True:
+            if self.debug:
+                print(f"[DEBUG] 调用LLM生成回复...")
+            
             response = client.chat.completions.create(
                 model=os.getenv("OPENAI_MODEL"),
                 messages=self.history,
@@ -365,7 +418,12 @@ class MagicCode:
                 print(f"Result: {sanitize_text(message.content.strip())}")
 
             if not message.tool_calls:
+                if self.debug:
+                    print(f"[DEBUG] 无更多工具调用，对话结束")
                 break
+
+            if self.debug:
+                print(f"[DEBUG] LLM返回 {len(message.tool_calls)} 个工具调用")
 
             tasks = []
             for tc in message.tool_calls:
@@ -419,4 +477,11 @@ class MagicCode:
 
 
 if __name__ == "__main__":
-    MagicCode().run()
+    parser = argparse.ArgumentParser(description="MagicCode - A2A Agent 编排客户端")
+    parser.add_argument("--debug", action="store_true", help="启用debug模式，打印详细调用流程")
+    args = parser.parse_args()
+    
+    if args.debug:
+        print("[DEBUG] Debug模式已启用")
+    
+    MagicCode(debug=args.debug).run()

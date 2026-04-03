@@ -12,7 +12,8 @@ from shared.debug import debug_log, is_debug_enabled, preview_text
 
 async def main() -> None:
     print("客服多智能体演示已启动，请先分别运行 triage/order/policy/logistics 四个 agent。")
-    print("示例：A1001到哪了；A1002退款什么时候到账；A1004延迟了可以补偿吗")
+    print("示例：订单A1001到哪了；订单A1002退款什么时候到账；订单A1004延迟了可以补偿吗")
+
     if is_debug_enabled():
         debug_log("Customer Console", f"调试模式已开启 | cwd={Path.cwd()}")
 

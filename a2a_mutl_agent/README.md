@@ -21,7 +21,21 @@
 
 ### 运行方式
 
-打开 5 个终端，在 `a2a_mutl_agent` 目录下分别运行：
+最简单的方式是一键启动：
+
+```bash
+uv run run_demo.py
+```
+
+如果你想看 agent 间调用方向：
+
+```bash
+uv run run_demo.py --debug
+```
+
+它会自动拉起 4 个 agent，然后直接进入客服控制台；退出控制台时也会自动回收本次启动的 agent 进程。
+
+如果你想分别观察每个进程，也可以打开 5 个终端，在 `a2a_mutl_agent` 目录下分别运行：
 
 ```bash
 uv run triage_agent.py
