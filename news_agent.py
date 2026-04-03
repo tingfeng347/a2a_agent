@@ -29,16 +29,19 @@ SUBAGENT_MODEL = os.getenv("SUBAGENT_MODEL")
 SUBAGENT_BASE_URL = os.getenv("SUBAGENT_BASE_URL")
 SUBAGENT_API_KEY = os.getenv("SUBAGENT_API_KEY")
 
+# 新闻子 agent 内部用于摘要整理的大模型客户端。
 llm_client = OpenAI(base_url=SUBAGENT_BASE_URL, api_key=SUBAGENT_API_KEY)
 
 
 def extract_topic(query: str) -> str:
+    # 从用户问题里提取新闻检索主题，提取失败时回退到默认热点。
     cleaned = re.sub(r"(帮我|请|一下|看看|查询|搜索|最近|最新|新闻|资讯|热点|消息|查|查下|查一下)", " ", query)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned or "今日热点"
 
 
 def polish_news_result_with_llm(topic: str, raw_result: str) -> str:
+    # 对 RSS 原始新闻列表做二次整理，生成更适合阅读的中文摘要。
     try:
         response = llm_client.chat.completions.create(
             model=SUBAGENT_MODEL,
@@ -73,6 +76,7 @@ def polish_news_result_with_llm(topic: str, raw_result: str) -> str:
 
 
 async def query_news(topic: str) -> str:
+    # 使用 Google News RSS 拉取指定主题的新闻列表。
     url = (
         "https://news.google.com/rss/search?"
         f"q={quote_plus(topic)}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
@@ -101,6 +105,7 @@ async def query_news(topic: str) -> str:
 class NewsAgentExecutor(AgentExecutor):
     @override
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        # A2A 执行入口：提取主题、检索新闻，再把结果写回事件流。
         if not context.message:
             raise Exception("No message provided")
 
@@ -134,6 +139,7 @@ class NewsAgentExecutor(AgentExecutor):
 
 
 def build_app() -> A2AStarletteApplication:
+    # 暴露标准 AgentCard，供主 agent 启动时自动发现新闻能力。
     skill = AgentSkill(
         id="news_query",
         name="news query agent",
@@ -143,7 +149,7 @@ def build_app() -> A2AStarletteApplication:
     )
     agent_card = AgentCard(
         name="News Agent",
-        description="A2A 新闻子Agent",
+        description="新闻子Agent",
         url="http://localhost:10003/",
         version="1.0.0",
         default_input_modes=["text"],
@@ -161,4 +167,5 @@ def build_app() -> A2AStarletteApplication:
 if __name__ == "__main__":
     import uvicorn
 
+    # 直接运行当前文件时，启动本地新闻子 agent 服务。
     uvicorn.run(build_app().build(), host="0.0.0.0", port=10003)

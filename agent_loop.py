@@ -2,7 +2,10 @@ import asyncio
 import json
 import locale
 import platform
+import re
 import subprocess
+from dataclasses import dataclass
+from urllib.parse import urlparse
 from typing import Any
 
 import dotenv
@@ -13,83 +16,166 @@ from a2a.client import (
     ClientFactory,
     create_text_message_object,
 )
+from a2a.types import AgentCard
 from a2a.types import TransportProtocol
 from a2a.utils.message import get_message_text
 from openai import OpenAI
 dotenv.load_dotenv()
 import os
 
-
-WEATHER_AGENT_BASE_URL = "http://localhost:10002"
-NEWS_AGENT_BASE_URL = "http://localhost:10003"
-
+# 主 agent 使用的大模型客户端。
 client = OpenAI(
     base_url=os.getenv("OPENAI_BASE_URL"),
     api_key=os.getenv("OPENAI_API_KEY"),
 )
 
-SYSTEM_PROMPT = """你是 MagicCode，一名能够自主编排子Agent的终端 AI 助手，回复尽量简洁有说服力。
+@dataclass
+class DiscoveredAgent:
+    # tool_name 是暴露给大模型的工具名，base_url 是实际调用地址。
+    tool_name: str
+    base_url: str
+    card: AgentCard
+    description: str
+
+
+def parse_subagent_index() -> list[str]:
+    # 支持通过环境变量覆盖默认索引，便于后续扩展更多子 agent。
+    raw = os.getenv("A2A_AGENT_URLS", "")
+    urls = [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
+    return urls 
+
+
+def slugify_tool_name(value: str) -> str:
+    # 将字符串转换成 function calling 可接受的稳定工具名。
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", value).strip("_").lower()
+    if not slug:
+        slug = "subagent"
+    if slug[0].isdigit():
+        slug = f"subagent_{slug}"
+    return slug
+
+
+def make_tool_name(card: AgentCard, base_url: str) -> str:
+    # 优先用 skill.id 命名，确保工具名尽可能稳定、可读。
+    for skill in card.skills or []:
+        if skill.id:
+            return slugify_tool_name(skill.id)
+    if card.name:
+        return slugify_tool_name(card.name)
+    host = urlparse(base_url).netloc or base_url
+    return slugify_tool_name(host)
+
+
+def build_agent_description(card: AgentCard) -> str:
+    # 将 AgentCard 中的描述、标签和示例整理成提示词可直接使用的能力摘要。
+    parts = [card.description or f"{card.name} 提供的能力"]
+    for skill in card.skills or []:
+        segment = skill.description or skill.name or skill.id
+        extras = []
+        if skill.tags:
+            extras.append("标签：" + "、".join(skill.tags[:5]))
+        if skill.examples:
+            extras.append("示例：" + "；".join(skill.examples[:2]))
+        if extras:
+            segment = f"{segment}（{'；'.join(extras)}）"
+        parts.append(segment)
+    return " ".join(part.strip() for part in parts if part and part.strip())
+
+
+async def discover_subagents() -> dict[str, DiscoveredAgent]:
+    # 启动时扫描所有子 agent，并读取各自的 AgentCard 建立运行时索引。
+    discovered: dict[str, DiscoveredAgent] = {}
+    async with httpx.AsyncClient(timeout=10.0) as httpx_client:
+        for base_url in parse_subagent_index():
+            try:
+                resolver = A2ACardResolver(httpx_client=httpx_client, base_url=base_url)
+                card = await resolver.get_agent_card()
+            except Exception as exc:
+                print(f"[discover] 跳过 {base_url}，读取 AgentCard 失败：{exc}")
+                continue
+
+            tool_name = make_tool_name(card, base_url)
+            while tool_name in discovered:
+                tool_name = f"{tool_name}_dup"
+
+            discovered[tool_name] = DiscoveredAgent(
+                tool_name=tool_name,
+                base_url=base_url,
+                card=card,
+                description=build_agent_description(card),
+            )
+    return discovered
+
+
+def build_system_prompt(agents: dict[str, DiscoveredAgent]) -> str:
+    # 根据扫描结果动态生成系统提示，避免在 prompt 里写死子 agent 能力。
+    agent_lines = []
+    for item in agents.values():
+        skill_names = ", ".join(
+            skill.name or skill.id for skill in (item.card.skills or []) if (skill.name or skill.id)
+        )
+        suffix = f" 技能：{skill_names}。" if skill_names else ""
+        agent_lines.append(f"- {item.tool_name}：{item.description}{suffix}")
+
+    agent_block = "\n".join(agent_lines) if agent_lines else "- 当前没有可用子Agent。"
+
+    return f"""你是 MagicCode，一名能够自主编排子Agent的终端 AI 助手，回复尽量简洁有说服力。
 
 ## 你的工具
 - bash：执行本机 shell 命令，适合文件操作、环境检查、代码搜索。
-- ask_weather_agent：通过 A2A 协议把天气相关任务交给天气子Agent。
-- ask_news_agent：通过 A2A 协议把新闻相关任务交给新闻子Agent。
+{agent_block}
 
 ## 调用规则
-1. 用户的问题涉及天气、气温、降雨、穿衣建议、出行天气时，优先调用 ask_weather_agent。
-2. 用户的问题涉及新闻、热点、最近发生了什么、某个主题的资讯时，优先调用 ask_news_agent。
-3. 同一个问题如果同时涉及天气和新闻，可以在同一轮并行调用多个子Agent，再整合结果回复。
-4. 不要为了查询天气或新闻去调用 bash，优先使用对应子Agent。
+1. 先根据工具描述和子Agent技能，自主判断应该调用哪个子Agent，不要依赖固定映射。
+2. 如果用户问题命中某个子Agent的能力，优先调用对应子Agent；仅当没有合适子Agent时再考虑 bash。
+3. 同一个问题如果涉及多个能力域，可以在同一轮并行调用多个子Agent，再整合结果回复。
+4. 在拿到子Agent结果后，再面向用户给出最终答复。
 
 ## 严格遵守
 1. 将复杂任务拆分为多个步骤，并逐步验证。
 2. 禁止执行破坏性命令。
 3. 只输出纯文本，不要任何 markdown 语法。
 4. 输出内容必须是中文。
-5. 在拿到子Agent结果后，再面向用户给出最终答复。
 """
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "bash",
-            "description": "Run a shell command.",
-            "parameters": {
-                "type": "object",
-                "properties": {"command": {"type": "string"}},
-                "required": ["command"],
+
+def build_tools(agents: dict[str, DiscoveredAgent]) -> list[dict[str, Any]]:
+    # 先保留 bash，再把动态发现的子 agent 全部注册成工具。
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Run a shell command.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
             },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "weather_agent",
-            "description": "通过 A2A 协议调用天气子Agent，查询天气、温度、降雨和出行建议。",
-            "parameters": {
-                "type": "object",
-                "properties": {"query": {"type": "string"}},
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "news_agent",
-            "description": "通过 A2A 协议调用新闻子Agent，查询实时新闻、热点和某个主题的资讯。",
-            "parameters": {
-                "type": "object",
-                "properties": {"query": {"type": "string"}},
-                "required": ["query"],
-            },
-        },
-    },
-]
+        }
+    ]
+
+    for item in agents.values():
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": item.tool_name,
+                    "description": item.description,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                },
+            }
+        )
+    return tools
 
 
 def run_bash(command: str, timeout: int = 10) -> str:
+    # 提供一个兜底 shell 工具，处理本地搜索、环境检查等任务。
     try:
         if platform.system().lower().startswith("win"):
             proc = subprocess.run(
@@ -118,6 +204,7 @@ def run_bash(command: str, timeout: int = 10) -> str:
 
 
 async def call_a2a_agent(base_url: str, query: str) -> str:
+    # 通过 A2A 协议向子 agent 发送请求，并提取最终文本结果。
     async with httpx.AsyncClient(timeout=30.0) as httpx_client:
         resolver = A2ACardResolver(httpx_client=httpx_client, base_url=base_url)
         card = await resolver.get_agent_card()
@@ -144,43 +231,60 @@ async def call_a2a_agent(base_url: str, query: str) -> str:
         return last_text or "子Agent没有返回内容。"
 
 
-async def weather_agent(query: str) -> str:
-    return await call_a2a_agent(WEATHER_AGENT_BASE_URL, query)
-
-
-async def news_agent(query: str) -> str:
-    return await call_a2a_agent(NEWS_AGENT_BASE_URL, query)
-
-
 async def handle_bash(arguments: dict[str, Any]) -> str:
+    # 将阻塞式 shell 调用放到线程池执行，避免卡住事件循环。
     return await asyncio.to_thread(run_bash, arguments.get("command", ""))
 
 
-async def handle_weather(arguments: dict[str, Any]) -> str:
-    return await weather_agent(arguments.get("query", ""))
-
-
-async def handle_news(arguments: dict[str, Any]) -> str:
-    return await news_agent(arguments.get("query", ""))
-
-
-TOOL_HANDLERS = {
-    "bash": handle_bash,
-    "weather_agent": handle_weather,
-    "news_agent": handle_news,
-}
-
-
 def sanitize_text(text: str) -> str:
+    # 统一做一次编码清洗，减少终端输出乱码的概率。
     return text.encode("utf-8", errors="replace").decode("utf-8")
+
+
+def print_discovered_agents(agents: dict[str, DiscoveredAgent], title: str) -> None:
+    # 启动和刷新时打印当前发现到的子 agent，方便观察索引状态。
+    print(title)
+    if not agents:
+        print("- 当前没有扫描到可用子Agent")
+        return
+
+    for item in agents.values():
+        print(f"URL:{item.base_url}")
+        print(f"名称: {item.card.name}")
+        print(f"能力: {item.description}")
 
 
 class MagicCode:
     def __init__(self):
-        self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # 初始化时先扫描子 agent，再据此生成 prompt、tools 和会话历史。
+        self.discovered_agents = asyncio.run(discover_subagents())
+        self.system_prompt = build_system_prompt(self.discovered_agents)
+        self.tools = build_tools(self.discovered_agents)
+        self.history = [{"role": "system", "content": self.system_prompt}]
+        print_discovered_agents(self.discovered_agents, "[discover] 扫描agent结果")
+
+    def reset_history(self):
+        self.history = [{"role": "system", "content": self.system_prompt}]
+
+    async def refresh_subagents(self):
+        # refresh 命令会重新扫描索引，并重建工具和系统提示。
+        self.discovered_agents = await discover_subagents()
+        self.system_prompt = build_system_prompt(self.discovered_agents)
+        self.tools = build_tools(self.discovered_agents)
+        self.reset_history()
+        print_discovered_agents(self.discovered_agents, "[discover] 刷新扫描结果")
+
+    async def handle_subagent(self, tool_name: str, arguments: dict[str, Any]) -> str:
+        # 将模型选中的工具名映射回子 agent 地址，再转发 query。
+        agent = self.discovered_agents.get(tool_name)
+        if not agent:
+            return f"未找到名为 {tool_name} 的子Agent。"
+        return await call_a2a_agent(agent.base_url, arguments.get("query", ""))
 
     def think_first(self, user_input: str) -> str:
+        # 先做一轮轻量意图规划，便于在终端里看到主 agent 的下一步动作。
         safe_input = sanitize_text(user_input)
+        tool_names = ", ".join(self.discovered_agents.keys()) or "无可用子Agent"
         think_messages = self.history + [
             {"role": "user", "content": safe_input},
             {
@@ -190,7 +294,7 @@ class MagicCode:
                     "要求："
                     "1. 输出内容必须是中文，且只包含对当前用户输入的理解与下一步意图；"
                     "2. 必须明确写出“无需调用工具”或“需要调用什么工具”；"
-                    "3. 如果是天气问题要调用weather_agent，如果是新闻问题要调用news_agent；"
+                    f"3. 如需调用子Agent，只能从这些工具里选择：{tool_names}；"
                     "4. 不要分点，不要编号，不要 markdown；"
                     "5. 不要直接给最终回答内容；"
                     "6. 不要输出多余解释。"
@@ -209,6 +313,7 @@ class MagicCode:
         return sanitize_text(msg.content.strip())
 
     async def _run_single_tool_call(self, tc, tool_count: int) -> dict[str, str | int]:
+        # 封装单次工具调用，便于后续并行执行多个 tool call。
         name = tc.function.name
         try:
             args = json.loads(tc.function.arguments or "{}")
@@ -221,11 +326,10 @@ class MagicCode:
 
         print(f"[{tool_count}] Act: 调用工具 {name} {info}")
 
-        handler = TOOL_HANDLERS.get(name)
-        if not handler:
-            result = f"Unknown tool: {name}"
+        if name == "bash":
+            result = await handle_bash(args)
         else:
-            result = await handler(args)
+            result = await self.handle_subagent(name, args)
         result = sanitize_text(result)
 
         return {
@@ -235,6 +339,7 @@ class MagicCode:
         }
 
     async def chat(self, user_input: str):
+        # 单轮对话可能包含多次工具调用，直到模型给出最终回复为止。
         tool_count = 0
         safe_input = sanitize_text(user_input)
 
@@ -248,7 +353,7 @@ class MagicCode:
             response = client.chat.completions.create(
                 model=os.getenv("OPENAI_MODEL"),
                 messages=self.history,
-                tools=TOOLS,
+                tools=self.tools,
                 parallel_tool_calls=True,
                 extra_body={"enable_thinking": False},
             )
@@ -287,6 +392,7 @@ class MagicCode:
                 break
 
     def run(self):
+        # 命令行主循环，支持 exit / clear / refresh 三个控制命令。
         while True:
             try:
                 user_input = input("chat> ").strip()
@@ -297,8 +403,11 @@ class MagicCode:
                 if cmd in ("exit", "quit"):
                     break
                 if cmd == "clear":
-                    self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
+                    self.reset_history()
                     print("历史已清空")
+                    continue
+                if cmd == "refresh":
+                    asyncio.run(self.refresh_subagents())
                     continue
 
                 asyncio.run(self.chat(user_input))

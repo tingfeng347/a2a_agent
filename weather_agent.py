@@ -27,10 +27,12 @@ SUBAGENT_MODEL = os.getenv("SUBAGENT_MODEL")
 SUBAGENT_BASE_URL = os.getenv("SUBAGENT_BASE_URL")
 SUBAGENT_API_KEY = os.getenv("SUBAGENT_API_KEY")
 
+# 天气子 agent 内部用于结果润色的大模型客户端。
 llm_client = OpenAI(base_url=SUBAGENT_BASE_URL, api_key=SUBAGENT_API_KEY)
 
 
 def extract_location(query: str) -> str:
+    # 从自然语言问题中尽量提取城市名，兼容几种常见问法。
     cleaned = re.sub(
         r"(帮我|请|查一下|查下|查询|看看|看下|一下|今天|明天|后天|现在|当前|想知道|想看)",
         "",
@@ -54,6 +56,7 @@ def extract_location(query: str) -> str:
 
 
 WEATHER_CODE_MAP = {
+    # Open-Meteo 返回的天气码到中文描述的映射。
     0: "晴朗",
     1: "大体晴",
     2: "局部多云",
@@ -81,6 +84,7 @@ def weather_code_to_text(code: int) -> str:
 
 
 def polish_weather_result_with_llm(raw_result: str) -> str:
+    # 把结构化天气数据整理成更自然、更适合直接回复用户的中文结果。
     try:
         response = llm_client.chat.completions.create(
             model=SUBAGENT_MODEL,
@@ -111,6 +115,7 @@ def polish_weather_result_with_llm(raw_result: str) -> str:
 
 
 async def query_weather(location: str) -> str:
+    # 先通过地理编码拿经纬度，再查询实时天气和当天概览。
     if not location:
         return "天气子Agent没有识别到城市，请在问题里明确城市名称。"
 
@@ -162,6 +167,7 @@ async def query_weather(location: str) -> str:
 class WeatherAgentExecutor(AgentExecutor):
     @override
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
+        # A2A 执行入口：读取输入、查询天气、把结果写回任务事件流。
         if not context.message:
             raise Exception("No message provided")
 
@@ -195,6 +201,7 @@ class WeatherAgentExecutor(AgentExecutor):
 
 
 def build_app() -> A2AStarletteApplication:
+    # 暴露标准 AgentCard，供主 agent 扫描后发现天气能力。
     skill = AgentSkill(
         id="weather_query",
         name="weather query agent",
@@ -204,7 +211,7 @@ def build_app() -> A2AStarletteApplication:
     )
     agent_card = AgentCard(
         name="Weather Agent",
-        description="A2A 天气子Agent",
+        description="天气子Agent",
         url="http://localhost:10002/",
         version="1.0.0",
         default_input_modes=["text"],
@@ -222,4 +229,5 @@ def build_app() -> A2AStarletteApplication:
 if __name__ == "__main__":
     import uvicorn
 
+    # 直接运行当前文件时，启动本地天气子 agent 服务。
     uvicorn.run(build_app().build(), host="0.0.0.0", port=10002)
